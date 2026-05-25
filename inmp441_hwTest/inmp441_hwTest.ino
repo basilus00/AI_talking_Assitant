@@ -4,9 +4,9 @@ void setup() {
   Serial.begin(115200);
   delay(3000);
   
-  Serial.println("=== MINIMAL TEST ===");
-  Serial.println("Leave mic completely SILENT");
-  Serial.println("Just sitting there, no touching");
+  Serial.println("=== FINAL HARDWARE TEST ===");
+  Serial.println("DO NOT TOUCH THE MICROPHONE");
+  Serial.println("Just let it sit in complete silence");
   Serial.println();
   
   i2s_config_t i2s_config = {
@@ -24,55 +24,64 @@ void setup() {
   };
 
   i2s_pin_config_t pin_config = {
-    .bck_io_num = 33,  // SCK
-    .ws_io_num = 25,   // WS
+    .bck_io_num = 33,
+    .ws_io_num = 25,
     .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = 32  // SD
+    .data_in_num = 32
   };
 
   i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pin_config);
   
-  Serial.println("Reading for 10 seconds...");
+  Serial.println("Collecting 100 samples...");
   
-  uint32_t maxVal = 0;
-  uint32_t minVal = 999999;
+  int samples[100];
   
-  unsigned long start = millis();
-  while (millis() - start < 10000) {
+  for (int i = 0; i < 100; i++) {
     int32_t sample;
     size_t bytes_read;
-    i2s_read(I2S_NUM_0, &sample, sizeof(sample), &bytes_read, pdMS_TO_TICKS(10));
+    i2s_read(I2S_NUM_0, &sample, sizeof(sample), &bytes_read, portMAX_DELAY);
     
     if (bytes_read > 0) {
       sample >>= 16;
-      uint32_t absVal = abs(sample);
-      
-      if (absVal > maxVal) maxVal = absVal;
-      if (absVal < minVal) minVal = absVal;
+      samples[i] = abs(sample);
+      delay(50);  // Wait between samples
     }
   }
   
+  // Calculate statistics
+  int sum = 0;
+  int maxVal = 0;
+  int minVal = 999999;
+  
+  for (int i = 0; i < 100; i++) {
+    sum += samples[i];
+    if (samples[i] > maxVal) maxVal = samples[i];
+    if (samples[i] < minVal) minVal = samples[i];
+  }
+  
+  int avg = sum / 100;
+  
   Serial.println();
-  Serial.print("Min value: ");
-  Serial.println(minVal);
-  Serial.print("Max value: ");
-  Serial.println(maxVal);
-  Serial.print("Average: ");
-  Serial.println((minVal + maxVal) / 2);
+  Serial.println("=== RESULTS ===");
+  Serial.print("Min: "); Serial.println(minVal);
+  Serial.print("Max: "); Serial.println(maxVal);
+  Serial.print("Avg: "); Serial.println(avg);
   Serial.println();
   
-  if (maxVal < 100) {
-    Serial.println("✓ GOOD - Mic is working properly!");
-  } else if (maxVal < 1000) {
-    Serial.println("△ ACCEPTABLE - Some noise but usable");
+  if (maxVal < 200 && avg < 100) {
+    Serial.println("✓ MICROPHONE IS GOOD");
+    Serial.println("  You can use it normally");
+  } else if (maxVal < 1000 && avg < 500) {
+    Serial.println("△ ACCEPTABLE (noisy but usable)");
   } else {
-    Serial.println("❌ BAD - Hardware problem confirmed!");
-    Serial.println("   Possible causes:");
-    Serial.println("   1. Defective microphone");
-    Serial.println("   2. L/R not actually connected");
-    Serial.println("   3. Powered with 5V (damaged)");
-    Serial.println("   4. Counterfeit/fake INMP441");
+    Serial.println("❌ MICROPHONE IS DAMAGED/DEFECTIVE");
+    Serial.println();
+    Serial.println("  RECOMMENDATIONS:");
+    Serial.println("  1. Buy a new INMP441 from reputable seller");
+    Serial.println("  2. Try Adafruit, SparkFun, or official distributors");
+    Serial.println("  3. NEVER power it with 5V!");
+    Serial.println("  4. Always use 3.3V only");
   }
 }
 

@@ -1,0 +1,5 @@
+So in order to test the speaker functionalities we wanted to understand first how to control audio signals from internal signals that ESP32 outputs
+before using the Amplifier module we wanted to test the internal DAC (8bit) capabilities first
+so in that case we need audio libraries that we got from github from pschatzmann repositories
+repo1 : arduino-audio-tools
+repo2: ESP32-A2DP

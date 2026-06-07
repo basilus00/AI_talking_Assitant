@@ -1,16 +1,20 @@
 #include <driver/i2s.h>
-#include <Arduino.h>
+#include <SD.h>
+#include <SPI.h>
 
 // ==================== PIN CONFIGURATION ====================
-// INMP441 Microphone (I2S Input)
+// INMP441 Microphone
 #define MIC_WS      25
 #define MIC_SD      32
 #define MIC_SCK     33
 
-// MAX98357A Amplifier (I2S Output)
+// MAX98357A Amplifier
 #define AMP_BCLK    27
 #define AMP_LRC     14
 #define AMP_DIN     26
+
+// SD Card (SPI)
+#define SD_CS       5
 
 #define LED_PIN     2
 
@@ -19,23 +23,37 @@
 #define BITS_PER_SAMPLE 32
 #define DMA_BUF_COUNT   8
 #define DMA_BUF_LEN     64
-
-// WROOM RAM OPTIMIZATION
-// 16kHz * 4 bytes * 10 seconds = ~640KB (too much for WROOM)
-// Use 8-bit compression or reduce duration
-#define RECORD_SECONDS  3           // Max ~3 seconds for WROOM safety
-#define MAX_SAMPLES     (SAMPLE_RATE * RECORD_SECONDS)
-#define BUFFER_SIZE     512         // Smaller chunks
+#define BUFFER_SIZE     512
 
 // I2S ports
 #define I2S_MIC_PORT    I2S_NUM_0
 #define I2S_AMP_PORT    I2S_NUM_1
 
-// Recording buffer (in normal RAM)
-int32_t recordBuffer[MAX_SAMPLES];  // ~192KB for 3 seconds
-size_t recordedSamples = 0;
+// WAV file header
+struct WavHeader {
+  char riff[4] = {'R','I','F','F'};
+  uint32_t fileSize;
+  char wave[4] = {'W','A','V','E'};
+  char fmt[4] = {'f','m','t',' '};
+  uint32_t fmtSize = 16;
+  uint16_t audioFormat = 1;
+  uint16_t numChannels = 1;
+  uint32_t sampleRate = SAMPLE_RATE;
+  uint32_t byteRate = SAMPLE_RATE * 4;
+  uint16_t blockAlign = 4;
+  uint16_t bitsPerSample = 32;
+  char data[4] = {'d','a','t','a'};
+  uint32_t dataSize;
+};
+
+// State
 bool isRecording = false;
 bool isPlaying = false;
+File audioFile;
+const char* filename = "/recording.wav";
+
+// Small RAM buffer for transfers
+int32_t transferBuffer[BUFFER_SIZE];
 
 // ==================== SETUP ====================
 void setup() {
@@ -45,23 +63,33 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  // Check available RAM
-  Serial.printf("Total heap: %d bytes\n", ESP.getHeapSize());
+  // Initialize SD card
+  SPI.begin(18, 19, 23, SD_CS); // SCK, MISO, MOSI, CS
+  pinMode(SD_CS, OUTPUT);
+  
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD Card initialization failed!");
+    Serial.println("Check wiring and format as FAT32");
+    while(1) {
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      delay(200);
+    }
+  }
+  
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  Serial.printf("SD Card initialized. Size: %lluMB\n", cardSize);
   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-  Serial.printf("Recording buffer: %d bytes (%d seconds @ 16kHz)\n", 
-                MAX_SAMPLES * 4, RECORD_SECONDS);
 
   setupMicrophone();
   setupAmplifier();
   
-  Serial.println("\n=== ESP32-WROOM Voice Record & Play ===");
-  Serial.println("Commands: 'r'=record, 's'=stop, 'p'=play, 'l'=loopback, 'm'=monitor");
-  Serial.printf("Max recording: %d seconds\n", RECORD_SECONDS);
+  Serial.println("\n=== ESP32 Voice Record & Play (SD Card) ===");
+  Serial.println("Commands: r=record, s=stop, p=play, l=loopback, d=delete");
 }
 
-// ==================== I2S MICROPHONE SETUP ====================
+// ==================== I2S SETUP ====================
 void setupMicrophone() {
-  i2s_config_t i2s_mic_config = {
+  i2s_config_t cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
@@ -75,26 +103,20 @@ void setupMicrophone() {
     .fixed_mclk = 0
   };
 
-  i2s_pin_config_t mic_pin_config = {
+  i2s_pin_config_t pins = {
     .bck_io_num = MIC_SCK,
     .ws_io_num = MIC_WS,
     .data_out_num = I2S_PIN_NO_CHANGE,
     .data_in_num = MIC_SD
   };
 
-  esp_err_t err = i2s_driver_install(I2S_MIC_PORT, &i2s_mic_config, 0, NULL);
-  if (err != ESP_OK) {
-    Serial.printf("Mic I2S driver install failed: %d\n", err);
-    return;
-  }
-  
-  i2s_set_pin(I2S_MIC_PORT, &mic_pin_config);
+  i2s_driver_install(I2S_MIC_PORT, &cfg, 0, NULL);
+  i2s_set_pin(I2S_MIC_PORT, &pins);
   Serial.println("Microphone ready");
 }
 
-// ==================== I2S AMPLIFIER SETUP ====================
 void setupAmplifier() {
-  i2s_config_t i2s_amp_config = {
+  i2s_config_t cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
@@ -108,97 +130,124 @@ void setupAmplifier() {
     .fixed_mclk = 0
   };
 
-  i2s_pin_config_t amp_pin_config = {
+  i2s_pin_config_t pins = {
     .bck_io_num = AMP_BCLK,
     .ws_io_num = AMP_LRC,
     .data_out_num = AMP_DIN,
     .data_in_num = I2S_PIN_NO_CHANGE
   };
 
-  esp_err_t err = i2s_driver_install(I2S_AMP_PORT, &i2s_amp_config, 0, NULL);
-  if (err != ESP_OK) {
-    Serial.printf("Amp I2S driver install failed: %d\n", err);
-    return;
-  }
-  
-  i2s_set_pin(I2S_AMP_PORT, &amp_pin_config);
+  i2s_driver_install(I2S_AMP_PORT, &cfg, 0, NULL);
+  i2s_set_pin(I2S_AMP_PORT, &pins);
   Serial.println("Amplifier ready");
 }
 
-// ==================== AUDIO FUNCTIONS ====================
-
-size_t readMicrophone(int32_t *samples, size_t count) {
-  size_t bytes_read = 0;
-  i2s_read(I2S_MIC_PORT, samples, count * sizeof(int32_t), &bytes_read, portMAX_DELAY);
-  return bytes_read / sizeof(int32_t);
+// ==================== RECORD TO SD ====================
+void writeWavHeader(File &file, uint32_t dataSize) {
+  WavHeader header;
+  header.fileSize = 36 + dataSize;
+  header.dataSize = dataSize;
+  file.write((uint8_t*)&header, sizeof(header));
 }
 
-size_t writeAmplifier(const int32_t *samples, size_t count) {
-  size_t bytes_written = 0;
-  i2s_write(I2S_AMP_PORT, samples, count * sizeof(int32_t), &bytes_written, portMAX_DELAY);
-  return bytes_written / sizeof(int32_t);
+void updateWavHeader(File &file) {
+  uint32_t fileSize = file.size();
+  uint32_t dataSize = fileSize - 44;
+  
+  file.seek(4);
+  uint32_t riffSize = 36 + dataSize;
+  file.write((uint8_t*)&riffSize, 4);
+  
+  file.seek(40);
+  file.write((uint8_t*)&dataSize, 4);
 }
 
-// ==================== RECORD ====================
 void recordAudio() {
   if (isRecording || isPlaying) return;
   
+  // Delete old file if exists
+  if (SD.exists(filename)) {
+    SD.remove(filename);
+  }
+  
+  audioFile = SD.open(filename, FILE_WRITE);
+  if (!audioFile) {
+    Serial.println("Failed to create file!");
+    return;
+  }
+  
+  // Write placeholder header
+  writeWavHeader(audioFile, 0);
+  
   isRecording = true;
-  recordedSamples = 0;
-  Serial.println("Recording...");
+  Serial.println("Recording to SD... Press 's' to stop");
   digitalWrite(LED_PIN, HIGH);
   
   unsigned long lastBlink = millis();
   bool ledState = true;
+  uint32_t totalSamples = 0;
   
-  while (isRecording && recordedSamples < MAX_SAMPLES) {
-    size_t samplesToRead = min((size_t)BUFFER_SIZE, MAX_SAMPLES - recordedSamples);
-    size_t samplesRead = readMicrophone(&recordBuffer[recordedSamples], samplesToRead);
-    recordedSamples += samplesRead;
+  while (isRecording) {
+    size_t bytesRead = 0;
+    i2s_read(I2S_MIC_PORT, transferBuffer, sizeof(transferBuffer), &bytesRead, portMAX_DELAY);
     
-    // Blink LED every 300ms
+    if (bytesRead > 0) {
+      audioFile.write((uint8_t*)transferBuffer, bytesRead);
+      totalSamples += bytesRead / 4;
+    }
+    
+    // Blink LED
     if (millis() - lastBlink > 300) {
       ledState = !ledState;
       digitalWrite(LED_PIN, ledState ? HIGH : LOW);
       lastBlink = millis();
     }
     
-    // Check for stop
+    // Check stop command
     if (Serial.available() && Serial.read() == 's') {
       isRecording = false;
     }
   }
   
+  // Update header with actual size
+  updateWavHeader(audioFile);
+  audioFile.close();
+  
   digitalWrite(LED_PIN, LOW);
-  Serial.printf("Recorded: %d samples (%.1fs)\n", 
-                recordedSamples, (float)recordedSamples / SAMPLE_RATE);
-  isRecording = false;
+  Serial.printf("Saved! Duration: %.1f seconds, Size: %d bytes\n", 
+                (float)totalSamples / SAMPLE_RATE, SD.open(filename).size());
 }
 
-// ==================== PLAYBACK ====================
+// ==================== PLAY FROM SD ====================
 void playAudio() {
-  if (isRecording || isPlaying || recordedSamples == 0) return;
+  if (isRecording || isPlaying) return;
+  
+  if (!SD.exists(filename)) {
+    Serial.println("No recording found!");
+    return;
+  }
+  
+  audioFile = SD.open(filename, FILE_READ);
+  if (!audioFile) {
+    Serial.println("Failed to open file!");
+    return;
+  }
+  
+  // Skip WAV header (44 bytes)
+  audioFile.seek(44);
   
   isPlaying = true;
-  Serial.println("Playing...");
+  Serial.println("Playing from SD...");
   digitalWrite(LED_PIN, HIGH);
   
-  size_t played = 0;
-  int32_t tempBuffer[BUFFER_SIZE];
-  
-  while (isPlaying && played < recordedSamples) {
-    size_t chunk = min((size_t)BUFFER_SIZE, recordedSamples - played);
+  while (isPlaying && audioFile.available()) {
+    size_t bytesToRead = min((size_t)sizeof(transferBuffer), (size_t)audioFile.available());
+    size_t bytesRead = audioFile.read((uint8_t*)transferBuffer, bytesToRead);
     
-    for (size_t i = 0; i < chunk; i++) {
-      // Apply volume (1.5x boost)
-      int64_t sample = (int64_t)recordBuffer[played + i] * 3 / 2;
-      if (sample > INT32_MAX) sample = INT32_MAX;
-      if (sample < INT32_MIN) sample = INT32_MIN;
-      tempBuffer[i] = (int32_t)sample;
+    if (bytesRead > 0) {
+      size_t bytesWritten = 0;
+      i2s_write(I2S_AMP_PORT, transferBuffer, bytesRead, &bytesWritten, portMAX_DELAY);
     }
-    
-    writeAmplifier(tempBuffer, chunk);
-    played += chunk;
     
     if (Serial.available() && Serial.read() == 's') {
       isPlaying = false;
@@ -206,29 +255,31 @@ void playAudio() {
   }
   
   i2s_zero_dma_buffer(I2S_AMP_PORT);
+  audioFile.close();
+  
   digitalWrite(LED_PIN, LOW);
   Serial.println("Playback done");
   isPlaying = false;
 }
 
-// ==================== LOOPBACK (Real-time) ====================
+// ==================== LOOPBACK ====================
 void loopbackMode() {
   if (isRecording || isPlaying) return;
   
   Serial.println("Loopback ON. Press 's' to stop.");
   digitalWrite(LED_PIN, HIGH);
   
-  int32_t buffer[BUFFER_SIZE];
-  
   while (true) {
-    size_t samples = readMicrophone(buffer, BUFFER_SIZE);
+    size_t bytesRead = 0;
+    i2s_read(I2S_MIC_PORT, transferBuffer, sizeof(transferBuffer), &bytesRead, portMAX_DELAY);
     
-    // Simple noise gate
-    for (size_t i = 0; i < samples; i++) {
-      if (abs(buffer[i]) < 30000) buffer[i] = 0;
+    // Noise gate
+    for (int i = 0; i < bytesRead / 4; i++) {
+      if (abs(transferBuffer[i]) < 30000) transferBuffer[i] = 0;
     }
     
-    writeAmplifier(buffer, samples);
+    size_t bytesWritten = 0;
+    i2s_write(I2S_AMP_PORT, transferBuffer, bytesRead, &bytesWritten, portMAX_DELAY);
     
     if (Serial.available() && Serial.read() == 's') break;
   }
@@ -238,25 +289,14 @@ void loopbackMode() {
   Serial.println("Loopback OFF");
 }
 
-// ==================== MONITOR LEVELS ====================
-void monitorLevels() {
-  Serial.println("Monitoring 10 seconds...");
-  unsigned long start = millis();
-  
-  while (millis() - start < 10000) {
-    int32_t sample = 0;
-    size_t bytes_read;
-    i2s_read(I2S_MIC_PORT, &sample, sizeof(sample), &bytes_read, portMAX_DELAY);
-    
-    int level = abs(sample) / 10000;  // Scale for readability
-    Serial.println(level);
-    
-    digitalWrite(LED_PIN, level > 50 ? HIGH : LOW);
-    delay(10);
+// ==================== DELETE FILE ====================
+void deleteRecording() {
+  if (SD.exists(filename)) {
+    SD.remove(filename);
+    Serial.println("Recording deleted");
+  } else {
+    Serial.println("No file to delete");
   }
-  
-  digitalWrite(LED_PIN, LOW);
-  Serial.println("Monitor done");
 }
 
 // ==================== MAIN LOOP ====================
@@ -268,14 +308,14 @@ void loop() {
       case 'r': recordAudio(); break;
       case 'p': playAudio(); break;
       case 'l': loopbackMode(); break;
-      case 'm': monitorLevels(); break;
+      case 'd': deleteRecording(); break;
       case 's': 
         isRecording = false;
         isPlaying = false;
         Serial.println("Stop");
         break;
       default:
-        Serial.println("r=record, p=play, l=loopback, m=monitor, s=stop");
+        Serial.println("r=record, p=play, l=loopback, d=delete, s=stop");
         break;
     }
   }
